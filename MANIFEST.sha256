@@ -1,0 +1,5 @@
+9e95c3540648beea8bb4feb3b9452d4af3c011780149adbc1a9ba6057ca4d3ab  deploy/joe-mcp-rust-agent.service.in
+b921fb28b8eb8eff837413acccca724743d4e39d24b8703573371469d0d1fb45  deploy/joe-mcp-rust-update.service.in
+fa65ce9cbf91557d43bbd882fe6bc0119702eac511a44af916ee02647fa587b9  scripts/install-node.sh
+c077869db27964de60513b1044220dc3b78057c99a2c3c8fc54d2237f6633a17  src/agent.rs
+aea7960c0c7b43ced130b1c1dd66a733e9362b7e9a439515b59ee5987069dbff  src/updater.rs

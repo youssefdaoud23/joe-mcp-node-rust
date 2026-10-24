@@ -1,0 +1,21 @@
+[Unit]
+Description=Joe MCP Rust Guarded Managed Node Updater
+After=network-online.target joe-mcp-rust-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/libexec/joe-mcp-rust-updater --server @SERVER@
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

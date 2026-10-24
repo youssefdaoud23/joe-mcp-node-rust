@@ -1,0 +1,9 @@
+{
+  "generated": true,
+  "name": "joe-mcp-node-rust",
+  "node_version": "0.1.0",
+  "runtime_files": 5,
+  "schema_version": 1,
+  "source_commit": "83f1f60352f4c311e940d1070f5d21ca5e8e1589",
+  "source_private_repository": "joe-mcp-server-rust"
+}
