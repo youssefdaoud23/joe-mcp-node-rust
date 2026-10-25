@@ -12,6 +12,8 @@ Use the private server repository when deploying the Joe controller:
 
 `youssefdaoud23/joe-mcp-server-rust`
 
+A fresh Rust controller now has a bootstrap installer. On the controller host, clone the server repo, copy `.env.example` to `.env`, set `JOE_RUST_PUBLIC_URL`, then run `sudo ./install.sh`. The server README and `docs/INSTALL.md` explain every file, environment value, runtime path, HTTPS step and ChatGPT connection step.
+
 Use this node package/public repository when installing or reviewing the managed Linux agent:
 
 `youssefdaoud23/joe-mcp-node-rust`
