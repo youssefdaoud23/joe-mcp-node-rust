@@ -15,6 +15,12 @@ use std::{
 };
 use tokio::{fs, process::Command};
 
+const LEGACY_PYTHON_UNITS: &[&str] = &[
+    "joe-mcp-node-agent.service",
+    "joe-mcp-host-bridge.service",
+    "joe-mcp-session-host.service",
+];
+
 #[derive(Parser, Debug)]
 #[command(name = "joe-mcp-rust-agent", version)]
 struct Args {
@@ -46,6 +52,8 @@ struct AgentConfig {
     device_id: String,
     token: String,
     name: String,
+    #[serde(default)]
+    legacy_migration_pending: bool,
 }
 
 #[tokio::main]
@@ -94,6 +102,7 @@ async fn main() -> Result<()> {
             } else {
                 args.name.clone()
             },
+            legacy_migration_pending: false,
         };
         if cfg.device_id.is_empty() || cfg.token.is_empty() {
             return Err(anyhow!("controller returned incomplete enrollment"));
@@ -170,6 +179,11 @@ async fn run_loop(
                 continue;
             }
         };
+        if cfg.legacy_migration_pending
+            && let Err(e) = complete_legacy_python_handoff(&mut cfg, config_path).await
+        {
+            tracing::warn!(error=%e,"legacy Python node handoff is still pending");
+        }
         if let Some(policy) = payload.get("developer_access")
             && let Err(e) = developer.configure(policy).await
         {
@@ -509,6 +523,42 @@ fn scope_resolve(path: &Path) -> Result<PathBuf> {
     ))
 }
 
+async fn complete_legacy_python_handoff(cfg: &mut AgentConfig, config_path: &str) -> Result<()> {
+    if !cfg.legacy_migration_pending {
+        return Ok(());
+    }
+    let updater_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "joe-mcp-node-update.service"])
+        .status()
+        .await
+        .is_ok_and(|status| status.success());
+    if updater_active {
+        tracing::info!("legacy Python updater is still active; deferring handoff");
+        return Ok(());
+    }
+    for unit in LEGACY_PYTHON_UNITS {
+        let unit_path = Path::new("/etc/systemd/system").join(unit);
+        if !unit_path.exists() {
+            continue;
+        }
+        let status = Command::new("systemctl")
+            .args(["disable", "--now", unit])
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(anyhow!(
+                "unable to disable legacy Python service {unit} for Rust handoff"
+            ));
+        }
+    }
+    cfg.legacy_migration_pending = false;
+    save_config(config_path, cfg).await?;
+    tracing::info!(
+        "legacy Python node handoff completed; legacy units remain installed but disabled for rollback"
+    );
+    Ok(())
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "rust-node".into())
@@ -526,6 +576,7 @@ async fn load_or_build(args: &Args) -> Result<AgentConfig> {
         device_id: args.device_id.clone(),
         token: args.token.clone(),
         name: args.name.clone(),
+        legacy_migration_pending: false,
     })
 }
 async fn save_config(path: &str, cfg: &AgentConfig) -> Result<()> {
@@ -543,6 +594,23 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn legacy_handoff_disables_all_python_runtime_helpers() {
+        assert_eq!(
+            LEGACY_PYTHON_UNITS,
+            [
+                "joe-mcp-node-agent.service",
+                "joe-mcp-host-bridge.service",
+                "joe-mcp-session-host.service",
+            ]
+        );
+        assert!(
+            LEGACY_PYTHON_UNITS
+                .iter()
+                .all(|unit| !unit.contains("rust"))
+        );
+    }
 
     #[tokio::test]
     async fn result_submission_retries_transient_controller_failure() {
@@ -570,6 +638,7 @@ mod tests {
             device_id: "dev_test".into(),
             token: "device-test-token".into(),
             name: "test".into(),
+            legacy_migration_pending: false,
         };
         submit_result_with_retry(
             &client,

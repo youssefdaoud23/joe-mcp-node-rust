@@ -4,11 +4,25 @@ SERVER="${JOE_RUST_SERVER:-}"
 ENROLL=""
 NAME="$(hostname 2>/dev/null || echo managed-node)"
 CONFIG="/var/lib/joe-mcp-rust-agent/config.json"
+LEGACY_CONFIG="/var/lib/joe-mcp-agent/config.json"
+MIGRATED_LEGACY=0
+rollback_legacy_migration() {
+  local rc="${1:-$?}"
+  if [[ "$MIGRATED_LEGACY" == "1" ]]; then
+    systemctl disable --now joe-mcp-rust-agent.service >/dev/null 2>&1 || true
+    rm -f "$CONFIG" || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "Rust migration failed before handoff; legacy Python Joe remains the active rollback path." >&2
+  fi
+  exit "$rc"
+}
+trap 'rollback_legacy_migration $?' ERR
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server) SERVER="${2:-}"; shift 2;;
     --enroll|--pairing-code) ENROLL="${2:-}"; shift 2;;
     --name) NAME="${2:-}"; shift 2;;
+    --install-dir) shift 2;; # accepted only for legacy managed-updater compatibility
     *) echo "Unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -29,6 +43,35 @@ install -d -m 0755 /usr/local/libexec
 install -d -m 0700 /var/lib/joe-mcp-rust-agent
 install -m 0755 "$TMP/agent" /usr/local/libexec/joe-mcp-rust-agent
 install -m 0755 "$TMP/updater" /usr/local/libexec/joe-mcp-rust-updater
+if [[ ! -s "$CONFIG" && -z "$ENROLL" && -s "$LEGACY_CONFIG" ]]; then
+  command -v python3 >/dev/null || { echo "python3 is required to migrate an existing Python-generation Joe node." >&2; exit 1; }
+  python3 - "$LEGACY_CONFIG" "$CONFIG" "$SERVER" "$NAME" <<'PYMIGRATE'
+import json, os, pathlib, re, sys
+legacy_path, config_path, expected_server, fallback_name = sys.argv[1:]
+with open(legacy_path, "r", encoding="utf-8") as handle:
+    legacy = json.load(handle)
+server = str(legacy.get("server") or "").rstrip("/")
+if server != expected_server.rstrip("/"):
+    raise SystemExit("Legacy Joe node belongs to a different controller; refusing identity migration.")
+device_id = str(legacy.get("device_id") or "")
+token = str(legacy.get("device_token") or legacy.get("token") or "")
+name = str(legacy.get("name") or fallback_name)
+if not device_id.startswith("dev_") or len(token) < 32 or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+    raise SystemExit("Legacy Joe node identity is incomplete or invalid; refusing migration.")
+payload = {"server": expected_server.rstrip("/"), "device_id": device_id, "token": token, "name": name, "legacy_migration_pending": True}
+target = pathlib.Path(config_path)
+target.parent.mkdir(parents=True, exist_ok=True)
+tmp = target.with_name("." + target.name + ".migrate")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, target)
+os.chmod(target, 0o600)
+PYMIGRATE
+  MIGRATED_LEGACY=1
+  echo "Imported the existing Joe device identity for an in-place Rust migration."
+fi
 if [[ ! -s "$CONFIG" ]]; then
   [[ -n "$ENROLL" ]] || { echo "A one-time --enroll code is required for first installation." >&2; exit 1; }
   /usr/local/libexec/joe-mcp-rust-agent --server "$SERVER" --enroll "$ENROLL" --name "$NAME" --config "$CONFIG" --enroll-only
@@ -54,7 +97,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -85,6 +128,10 @@ systemctl daemon-reload
 systemctl enable joe-mcp-rust-agent.service >/dev/null
 systemctl restart joe-mcp-rust-agent.service
 for _ in $(seq 1 20); do systemctl is-active --quiet joe-mcp-rust-agent.service && break; sleep 1; done
-systemctl is-active --quiet joe-mcp-rust-agent.service || { echo "Rust Joe agent failed to start." >&2; exit 1; }
+if ! systemctl is-active --quiet joe-mcp-rust-agent.service; then
+  echo "Rust Joe agent failed to start." >&2
+  rollback_legacy_migration 1
+fi
+trap - ERR
 echo "Joe MCP Rust Agent is ready: $NAME"
 echo "Controller: $SERVER"

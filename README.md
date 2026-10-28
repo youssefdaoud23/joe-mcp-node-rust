@@ -188,9 +188,11 @@ sudo cat /var/lib/joe-mcp-rust-agent/update-status.json
 
 Do not manually overwrite the official agent binary if you want rollback-aware managed updates to remain reliable.
 
-## Reinstalling an existing node
+## Reinstalling or migrating an existing node
 
-Running the installer again on a machine with an existing valid configuration preserves the existing device identity rather than creating a new device, unless the local configuration has been removed/revoked.
+Running the installer again on a machine with an existing valid Rust configuration preserves the existing device identity rather than creating a new device, unless the local configuration has been removed/revoked.
+
+When the Rust installer runs on a legacy Python-generation Joe node and no Rust config or new enrollment code is supplied, it validates the legacy controller origin and imports that node's existing device ID, device credential and name into the protected Rust config. The Rust agent marks the handoff as pending, proves it can authenticate to the controller, waits for any legacy updater run to finish, and only then disables and stops the old Python node-agent unit so only Rust survives reboot. The legacy unit and files remain installed as an explicit rollback path until Rust parity, update and reboot checks are complete. Rollback is deliberate: disable the Rust agent, then re-enable and start the legacy Python agent.
 
 Use the current controller URL:
 
