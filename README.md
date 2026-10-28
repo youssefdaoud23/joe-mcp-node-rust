@@ -129,6 +129,68 @@ The service should be active/running.
 
 Then return to the Joe UI and confirm the device appears online under **Devices**.
 
+## Run and control the node service
+
+The node agent is a normal systemd service.
+
+Status:
+
+```bash
+sudo systemctl status joe-mcp-rust-agent.service --no-pager
+```
+
+Start:
+
+```bash
+sudo systemctl start joe-mcp-rust-agent.service
+```
+
+Stop temporarily without deleting identity/configuration:
+
+```bash
+sudo systemctl stop joe-mcp-rust-agent.service
+```
+
+Restart:
+
+```bash
+sudo systemctl restart joe-mcp-rust-agent.service
+```
+
+Enable at boot:
+
+```bash
+sudo systemctl enable joe-mcp-rust-agent.service
+```
+
+Disable at boot while preserving enrollment:
+
+```bash
+sudo systemctl disable --now joe-mcp-rust-agent.service
+```
+
+Logs:
+
+```bash
+sudo journalctl -u joe-mcp-rust-agent.service -n 200 --no-pager
+```
+
+Stopping/disabling the service makes the node offline but does **not** revoke the device from the controller and does not delete its local credential.
+
+## Using the node
+
+The node is normally controlled through the central Joe UI and ChatGPT connection. You do not log into the agent directly.
+
+After enrollment:
+
+1. confirm the device is online in Joe;
+2. review its Full/Restricted/Custom access policy;
+3. connect ChatGPT to the Joe MCP endpoint with OAuth;
+4. ask Joe to inspect or act on the device by name;
+5. use the device's filesystem/category policy and Developer Access controls to narrow what is allowed.
+
+The node remains the final local policy boundary. Controller/user permissions cannot override a local device restriction.
+
 ## How the node communicates
 
 The node initiates an outbound HTTPS connection/polling flow to the Joe controller.
@@ -211,23 +273,77 @@ For a clean migration, use the new controller's **Devices -> Add device** flow a
 
 If preserving the same Joe database/device identity and the public Joe URL remains unchanged, the node can normally reconnect without re-enrollment.
 
-## Uninstalling a node
+## Disconnecting, revoking, and uninstalling a node
 
-First revoke/remove the device from the Joe controller if it is still registered.
+These are different operations.
 
-Then on the Linux machine:
+### Temporarily disconnect while preserving identity
 
 ```bash
-sudo systemctl disable --now joe-mcp-rust-agent.service || true
+sudo systemctl stop joe-mcp-rust-agent.service
+```
+
+Or prevent it from returning after reboot:
+
+```bash
+sudo systemctl disable --now joe-mcp-rust-agent.service
+```
+
+This keeps `/var/lib/joe-mcp-rust-agent/config.json`, so the same enrolled identity can be started again later.
+
+### Revoke the device from the controller
+
+Before permanently retiring a node, revoke/remove its device registration from Joe using an authorized account/platform administrator.
+
+Revocation prevents the existing local device credential from authenticating again. Stopping or deleting the local service by itself does not revoke the server-side registration.
+
+### Full Rust node uninstall
+
+After revocation, remove the Rust runtime from the Linux machine:
+
+```bash
+sudo systemctl disable --now joe-mcp-rust-agent.service 2>/dev/null || true
+sudo systemctl stop joe-mcp-rust-update.service 2>/dev/null || true
 sudo rm -f /etc/systemd/system/joe-mcp-rust-agent.service
 sudo rm -f /etc/systemd/system/joe-mcp-rust-update.service
 sudo rm -f /usr/local/libexec/joe-mcp-rust-agent
 sudo rm -f /usr/local/libexec/joe-mcp-rust-updater
 sudo rm -rf /var/lib/joe-mcp-rust-agent
 sudo systemctl daemon-reload
+sudo systemctl reset-failed
 ```
 
-Only delete `/var/lib/joe-mcp-rust-agent` if you intentionally want to remove the node's local identity and update history.
+Deleting `/var/lib/joe-mcp-rust-agent` permanently removes this machine's Rust Joe device credential, Developer Access state, update status, update backups, and recoverable Joe node trash.
+
+If you want to preserve the possibility of reconnecting the same local identity, do **not** delete that directory. Stop/disable the service instead.
+
+### Verify Rust node removal
+
+```bash
+systemctl status joe-mcp-rust-agent.service --no-pager || true
+ls -l /usr/local/libexec/joe-mcp-rust-agent /usr/local/libexec/joe-mcp-rust-updater 2>/dev/null || true
+ls -ld /var/lib/joe-mcp-rust-agent 2>/dev/null || true
+```
+
+The service should be absent/inactive and the paths should be absent after a full purge.
+
+### Legacy Python migration cleanup
+
+A machine migrated from the old Python-generation node may intentionally retain legacy Python units/files as rollback material. The Rust migration knows about legacy units including:
+
+```text
+joe-mcp-node-agent.service
+joe-mcp-host-bridge.service
+joe-mcp-session-host.service
+```
+
+Do not delete those automatically just because you uninstall the Rust node if you still need the Python rollback path.
+
+If the node is being retired **completely from Joe** and you have already verified that those legacy units/files belong only to Joe and are no longer needed, disable/remove the legacy Joe installation separately. Legacy installations can have different filesystem layouts, so inspect the unit definitions/config paths before deleting them rather than using a blind recursive removal command.
+
+### Re-enrolling after a full uninstall
+
+Once local identity has been deleted or the old device has been revoked, generate a **new** one-time enrollment command from **Devices -> Add device**. Do not restore a revoked credential from an old config backup.
 
 ## Troubleshooting
 
