@@ -193,6 +193,10 @@ async fn run_loop(
             .get("filesystem_policy")
             .cloned()
             .unwrap_or_else(|| json!({"mode":"restricted","roots":[]}));
+        let access_policy = payload
+            .get("access_policy")
+            .cloned()
+            .unwrap_or_else(|| json!({"mode":"read_only","categories":{}}));
         let remote_read_enabled = payload
             .get("remote_read_enabled")
             .and_then(Value::as_bool)
@@ -225,8 +229,6 @@ async fn run_loop(
             rotate_device_token(client, &mut cfg, config_path).await
         } else if tool == "__update_managed_agent__" {
             trigger_managed_update().await
-        } else if tool == "managed_update_status" {
-            managed_update_status().await
         } else if tool == "__developer_access_configure__" {
             developer
                 .configure(
@@ -259,16 +261,20 @@ async fn run_loop(
                         .unwrap_or("revoked"),
                 )
                 .await
-        } else if tool == "developer_access_status" {
-            developer.status().await
-        } else if tool == "start_developer_terminal" {
-            developer.start_terminal(&arguments).await
+        } else if let Err(e) = enforce_access_policy(&access_policy, &tool) {
+            Err(e)
         } else if catalog::is_read_tool(&tool) && !remote_read_enabled {
             Err(anyhow!("Remote reads are disabled by this device policy"))
         } else if catalog::is_action_tool(&tool) && !remote_action_enabled {
             Err(anyhow!("Remote actions are disabled by this device policy"))
         } else if let Err(e) = enforce_filesystem_scope(&filesystem_policy, &tool, &arguments) {
             Err(e)
+        } else if tool == "managed_update_status" {
+            managed_update_status().await
+        } else if tool == "developer_access_status" {
+            developer.status().await
+        } else if tool == "start_developer_terminal" {
+            developer.start_terminal(&arguments).await
         } else {
             executor.execute(&tool, arguments).await
         };
@@ -400,13 +406,67 @@ async fn report_offline(client: &Client, cfg: &AgentConfig) {
 }
 
 fn metadata(name: String, executor: &HostExecutor) -> Value {
-    json!({"name":name,"hostname":hostname(),"os":std::env::consts::OS,"agent_version":env!("CARGO_PKG_VERSION"),"software_version":env!("CARGO_PKG_VERSION"),"architecture":std::env::consts::ARCH,"routing_version":"1","filesystem_scope_version":"1","developer_access_version":"1","update_lifecycle":Path::new("/usr/local/libexec/joe-mcp-rust-updater").is_file(),"shutdown_lifecycle":true,"rust_policy":executor.policy_view()})
+    json!({"name":name,"hostname":hostname(),"os":std::env::consts::OS,"agent_version":env!("CARGO_PKG_VERSION"),"software_version":env!("CARGO_PKG_VERSION"),"architecture":std::env::consts::ARCH,"routing_version":"1","filesystem_scope_version":"2","developer_access_version":"1","update_lifecycle":Path::new("/usr/local/libexec/joe-mcp-rust-updater").is_file(),"shutdown_lifecycle":true,"rust_policy":executor.policy_view()})
 }
+fn enforce_access_policy(policy: &Value, tool: &str) -> Result<()> {
+    let is_read = catalog::is_read_tool(tool);
+    let is_action = catalog::is_action_tool(tool);
+    if !is_read && !is_action {
+        return Err(anyhow!(
+            "Remote tool is not classified by the managed-node catalog"
+        ));
+    }
+    match policy
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("read_only")
+    {
+        "full" => Ok(()),
+        "read_only" => {
+            if is_action {
+                Err(anyhow!(
+                    "Remote actions are disabled by this device access policy"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        "restricted" => {
+            let category = catalog::remote_tool_category(tool)
+                .ok_or_else(|| anyhow!("Remote tool has no managed-node access category"))?;
+            if matches!(category, "files" | "git" | "sqlite") {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Remote tool category is disabled while restricted filesystem access is active"
+                ))
+            }
+        }
+        "custom" => {
+            let category = catalog::remote_tool_category(tool)
+                .ok_or_else(|| anyhow!("Remote tool has no managed-node access category"))?;
+            let permission = policy
+                .get("categories")
+                .and_then(Value::as_object)
+                .and_then(|categories| categories.get(category))
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("Remote tool category is not enabled by Custom access"))?;
+            let key = if is_action { "action" } else { "read" };
+            if permission.get(key).and_then(Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(anyhow!("Remote tool category is disabled by Custom access"))
+            }
+        }
+        _ => Err(anyhow!("Unsupported device access policy mode")),
+    }
+}
+
 fn enforce_filesystem_scope(policy: &Value, tool: &str, args: &Value) -> Result<()> {
     let mode = policy
         .get("mode")
         .and_then(Value::as_str)
-        .unwrap_or("full_host");
+        .unwrap_or("restricted");
     if mode == "full_host" {
         return Ok(());
     }
@@ -420,68 +480,140 @@ fn enforce_filesystem_scope(policy: &Value, tool: &str, args: &Value) -> Result<
     if roots.is_empty() {
         return Err(anyhow!("Restricted filesystem policy has no roots"));
     }
-    if matches!(
-        tool,
-        "start_process"
-            | "start_workspace_shell"
-            | "start_managed_terminal"
-            | "start_workspace_python"
-            | "start_workspace_python_code"
-            | "start_workspace_node_check"
-            | "start_workspace_pytest"
-    ) {
-        return Err(anyhow!(
-            "Raw execution is disabled while restricted filesystem scope is active"
-        ));
-    }
     match tool {
+        "list_directory" | "directory_tree" | "read_text_file" | "read_file" | "path_info"
+        | "get_file_info" | "file_inspect" => {
+            scope_check_required_aliases(roots, args, &["path"], false)?;
+        }
+        "read_multiple_files" => {
+            scope_check_required_array(roots, args, "paths", false)?;
+        }
+        "search_files" | "search_content" => {
+            scope_check_required_aliases(roots, args, &["root"], false)?;
+        }
+        "start_search" => {
+            scope_check_required_aliases(roots, args, &["root", "path"], false)?;
+        }
+        "write_file" | "create_directory" | "trash_path" => {
+            scope_check_required_aliases(roots, args, &["path"], true)?;
+        }
+        "edit_file" | "edit_block" | "edit_spreadsheet_range" => {
+            scope_check_required_aliases(roots, args, &["path", "file_path"], true)?;
+        }
+        "write_pdf" => {
+            scope_check_required_aliases(roots, args, &["outputPath", "path"], true)?;
+        }
         "copy_file" => {
-            scope_check(roots, required_arg_path(args, "source")?, false)?;
-            scope_check(roots, required_arg_path(args, "destination")?, true)?;
+            scope_check_required_aliases(roots, args, &["source"], false)?;
+            scope_check_required_aliases(roots, args, &["destination"], true)?;
         }
         "move_file" => {
-            scope_check(roots, required_arg_path(args, "source")?, true)?;
-            scope_check(roots, required_arg_path(args, "destination")?, true)?;
+            scope_check_required_aliases(roots, args, &["source"], true)?;
+            scope_check_required_aliases(roots, args, &["destination"], true)?;
         }
-        "write_file" | "edit_file" | "edit_block" | "create_directory" | "trash_path"
-        | "restore_trash" | "purge_trash" => {
-            if let Some(p) = args.get("path").and_then(Value::as_str) {
-                scope_check(roots, p, true)?;
-            }
+        "restore_trash" => {
+            scope_check_required_aliases(roots, args, &["destination"], true)?;
         }
-        name if name.starts_with("git_") => {
-            if let Some(p) = args
-                .get("path")
-                .or_else(|| args.get("repo"))
-                .and_then(Value::as_str)
-            {
-                scope_check(roots, p, catalog::is_action_tool(name))?;
+        name if name.starts_with("git_") || name == "workspace_discover_git_worktrees" => {
+            scope_check_required_aliases(
+                roots,
+                args,
+                &["path", "repo"],
+                catalog::is_action_tool(name),
+            )?;
+            if matches!(name, "git_stage" | "git_restore_paths") {
+                validate_relative_pathspecs(args, "paths")?;
             }
         }
         "sqlite_tables" | "sqlite_schema" | "sqlite_query" | "sqlite_table_stats" => {
-            if let Some(p) = args
-                .get("database")
-                .or_else(|| args.get("path"))
-                .and_then(Value::as_str)
-            {
-                scope_check(roots, p, false)?;
-            }
+            scope_check_required_aliases(roots, args, &["database", "path"], false)?;
         }
+        "deployment_preflight" => {
+            scope_check_required_aliases(roots, args, &["path", "workspace"], false)?;
+        }
+        "deployment_restore_previous" => {
+            scope_check_required_aliases(roots, args, &["path", "workspace"], true)?;
+        }
+        // Retained session/search/trash state cannot be safely re-bound to a restricted root after
+        // creation. Global system, process, network, container, SAP, session and Developer Access
+        // tools also have effects or visibility outside the selected folder boundary. Fail closed.
         _ => {
-            for key in ["path", "root", "cwd", "script"] {
-                if let Some(p) = args.get(key).and_then(Value::as_str) {
-                    scope_check(roots, p, catalog::is_action_tool(tool))?;
-                }
-            }
+            return Err(anyhow!(
+                "Remote tool is not available while restricted filesystem scope is active"
+            ));
         }
     }
     Ok(())
 }
-fn required_arg_path<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{key} is required"))
+
+fn scope_check_required_aliases(
+    roots: &[Value],
+    args: &Value,
+    keys: &[&str],
+    write: bool,
+) -> Result<()> {
+    let mut found = false;
+    for key in keys {
+        if let Some(value) = args.get(*key) {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{key} must be a path string"))?;
+            if raw.trim().is_empty() {
+                return Err(anyhow!("{key} must not be empty"));
+            }
+            scope_check(roots, raw, write)?;
+            found = true;
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(anyhow!("one of {} is required", keys.join(", ")))
+    }
 }
+
+fn scope_check_required_array(roots: &[Value], args: &Value, key: &str, write: bool) -> Result<()> {
+    let values = args
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("{key} array is required"))?;
+    if values.is_empty() {
+        return Err(anyhow!("{key} array must not be empty"));
+    }
+    for value in values {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| anyhow!("{key} entries must be path strings"))?;
+        scope_check(roots, raw, write)?;
+    }
+    Ok(())
+}
+
+fn validate_relative_pathspecs(args: &Value, key: &str) -> Result<()> {
+    let Some(values) = args.get(key) else {
+        return Ok(());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| anyhow!("{key} must be an array"))?;
+    for value in values {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| anyhow!("{key} entries must be strings"))?;
+        let path = Path::new(raw);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!(
+                "Git pathspec escapes the restricted repository root"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn scope_check(roots: &[Value], raw: &str, write: bool) -> Result<()> {
     let candidate = scope_resolve(Path::new(raw))?;
     for root in roots {
@@ -492,6 +624,9 @@ fn scope_check(roots: &[Value], raw: &str, write: bool) -> Result<()> {
             .get("access")
             .and_then(Value::as_str)
             .unwrap_or("read_only");
+        if !matches!(access, "read_only" | "read_write") {
+            continue;
+        }
         let Ok(resolved_root) = std::fs::canonicalize(root_path) else {
             continue;
         };
@@ -505,22 +640,31 @@ fn scope_check(roots: &[Value], raw: &str, write: bool) -> Result<()> {
         "Filesystem read is outside the device's allowed roots"
     }))
 }
+
 fn scope_resolve(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(anyhow!("Filesystem scope paths must be absolute"));
     }
-    if let Ok(p) = std::fs::canonicalize(path) {
-        return Ok(p);
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return Ok(path);
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Filesystem path has no parent"))?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|_| anyhow!("Filesystem path parent does not exist"))?;
-    Ok(canonical_parent.join(
-        path.file_name()
-            .ok_or_else(|| anyhow!("Filesystem path is invalid"))?,
-    ))
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    loop {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| anyhow!("Filesystem path has no resolvable ancestor"))?;
+        suffix.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| anyhow!("Filesystem path has no resolvable ancestor"))?;
+        if let Ok(mut resolved) = std::fs::canonicalize(existing) {
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return Ok(resolved);
+        }
+    }
 }
 
 async fn complete_legacy_python_handoff(cfg: &mut AgentConfig, config_path: &str) -> Result<()> {
@@ -610,6 +754,126 @@ mod tests {
                 .iter()
                 .all(|unit| !unit.contains("rust"))
         );
+    }
+
+    #[test]
+    fn custom_access_enforces_tool_categories_and_action_kind() {
+        let policy = json!({
+            "mode":"custom",
+            "categories":{
+                "files":{"read":true,"action":false},
+                "system":{"read":false,"action":false},
+                "processes":{"read":true,"action":true}
+            }
+        });
+        enforce_access_policy(&policy, "read_text_file").unwrap();
+        assert!(enforce_access_policy(&policy, "write_file").is_err());
+        assert!(enforce_access_policy(&policy, "host_info").is_err());
+        enforce_access_policy(&policy, "list_processes").unwrap();
+        enforce_access_policy(&policy, "terminate_host_process").unwrap();
+        assert!(enforce_access_policy(&policy, "not_a_real_tool").is_err());
+    }
+
+    #[test]
+    fn restricted_access_blocks_global_categories() {
+        let policy = json!({"mode":"restricted","categories":{}});
+        enforce_access_policy(&policy, "read_text_file").unwrap();
+        enforce_access_policy(&policy, "git_status").unwrap();
+        enforce_access_policy(&policy, "sqlite_tables").unwrap();
+        assert!(enforce_access_policy(&policy, "service_status").is_err());
+        assert!(enforce_access_policy(&policy, "host_info").is_err());
+        assert!(enforce_access_policy(&policy, "start_managed_terminal").is_err());
+    }
+
+    #[test]
+    fn restricted_scope_honors_read_only_and_read_write_roots() {
+        let base =
+            std::env::temp_dir().join(format!("joe-agent-scope-access-{}", uuid::Uuid::new_v4()));
+        let read_only = base.join("read-only");
+        let read_write = base.join("read-write");
+        std::fs::create_dir_all(&read_only).unwrap();
+        std::fs::create_dir_all(&read_write).unwrap();
+        let ro_file = read_only.join("visible.txt");
+        let rw_file = read_write.join("editable.txt");
+        std::fs::write(&ro_file, "read").unwrap();
+        std::fs::write(&rw_file, "write").unwrap();
+        let policy = json!({
+            "mode":"restricted",
+            "roots":[
+                {"path":read_only,"access":"read_only"},
+                {"path":read_write,"access":"read_write"}
+            ]
+        });
+        enforce_filesystem_scope(&policy, "read_text_file", &json!({"path":ro_file})).unwrap();
+        assert!(
+            enforce_filesystem_scope(
+                &policy,
+                "write_file",
+                &json!({"path":read_only.join("new.txt")})
+            )
+            .is_err()
+        );
+        enforce_filesystem_scope(
+            &policy,
+            "write_file",
+            &json!({"path":read_write.join("new/nested.txt")}),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn restricted_scope_rejects_path_alias_bypasses() {
+        let base =
+            std::env::temp_dir().join(format!("joe-agent-scope-aliases-{}", uuid::Uuid::new_v4()));
+        let allowed = base.join("allowed");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let policy = json!({
+            "mode":"restricted",
+            "roots":[{"path":allowed,"access":"read_write"}]
+        });
+        let outside_file = outside.join("escape.txt").to_string_lossy().to_string();
+
+        for (tool, args) in [
+            (
+                "read_multiple_files",
+                json!({"paths":[outside_file.clone()]}),
+            ),
+            ("edit_file", json!({"file_path":outside_file.clone()})),
+            ("edit_block", json!({"file_path":outside_file.clone()})),
+            (
+                "edit_spreadsheet_range",
+                json!({"file_path":outside_file.clone()}),
+            ),
+            (
+                "write_pdf",
+                json!({"outputPath":outside_file.clone(),"path":allowed.join("safe.pdf")}),
+            ),
+            ("restore_trash", json!({"destination":outside_file.clone()})),
+            (
+                "deployment_preflight",
+                json!({"workspace":outside.to_string_lossy().to_string()}),
+            ),
+        ] {
+            let error = enforce_filesystem_scope(&policy, tool, &args).expect_err(tool);
+            assert!(error.to_string().contains("outside"), "{tool}: {error}");
+        }
+        assert!(
+            enforce_filesystem_scope(&policy, "get_search_results", &json!({"session_id":"old"}))
+                .is_err()
+        );
+        assert!(
+            enforce_filesystem_scope(&policy, "start_managed_terminal", &json!({"cwd":allowed}))
+                .is_err()
+        );
+        assert!(
+            enforce_filesystem_scope(&policy, "service_status", &json!({"unit":"ssh.service"}))
+                .is_err()
+        );
+        assert!(enforce_filesystem_scope(&policy, "deployment_verify", &json!({})).is_err());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]

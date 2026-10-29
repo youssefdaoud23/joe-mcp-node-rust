@@ -4,6 +4,6 @@
   "node_version": "0.1.0",
   "runtime_files": 5,
   "schema_version": 1,
-  "source_commit": "bcb46affeb6f6a20074a8bf9812bbf67bc5246e6",
+  "source_commit": "00ed597fc100c21292921ccc61c12c5f48ef329d",
   "source_private_repository": "joe-mcp-server-rust"
 }
