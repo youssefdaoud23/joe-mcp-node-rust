@@ -223,6 +223,13 @@ async fn run_loop(
             continue;
         }
         let shutdown = tool == "__shutdown_managed_agent__";
+        let heartbeat = tokio::spawn(busy_heartbeat_loop(
+            client.clone(),
+            cfg.clone(),
+            poll_url.clone(),
+            poll_seconds,
+            executor.clone(),
+        ));
         let outcome = if shutdown {
             Ok(json!({"accepted":true,"shutdown":true}))
         } else if tool == "__rotate_device_token__" {
@@ -278,6 +285,8 @@ async fn run_loop(
         } else {
             executor.execute(&tool, arguments).await
         };
+        heartbeat.abort();
+        let _ = heartbeat.await;
         let body = match outcome {
             Ok(result) => json!({"job_id":job_id,"result":result,"error":null}),
             Err(e) => json!({"job_id":job_id,"result":null,"error":e.to_string()}),
@@ -288,6 +297,46 @@ async fn run_loop(
         if shutdown {
             report_offline(client, &cfg).await;
             return Ok(());
+        }
+    }
+}
+
+fn busy_heartbeat_body(metadata: Value) -> Value {
+    json!({"metadata":metadata,"wait_seconds":0,"accept_job":false})
+}
+
+async fn busy_heartbeat_loop(
+    client: Client,
+    cfg: AgentConfig,
+    poll_url: String,
+    poll_seconds: u64,
+    executor: HostExecutor,
+) {
+    let heartbeat_interval = Duration::from_secs(poll_seconds.clamp(2, 10));
+    loop {
+        tokio::time::sleep(heartbeat_interval).await;
+        let meta = metadata(
+            if cfg.name.is_empty() {
+                hostname()
+            } else {
+                cfg.name.clone()
+            },
+            &executor,
+        );
+        match client
+            .post(&poll_url)
+            .header("Authorization", format!("Device {}", cfg.token))
+            .json(&busy_heartbeat_body(meta))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                tracing::warn!(status=%response.status(), "busy heartbeat rejected");
+            }
+            Err(error) => {
+                tracing::warn!(error=%error, "busy heartbeat transport failed");
+            }
         }
     }
 }
@@ -754,6 +803,14 @@ mod tests {
                 .iter()
                 .all(|unit| !unit.contains("rust"))
         );
+    }
+
+    #[test]
+    fn busy_heartbeat_never_accepts_remote_work() {
+        let body = busy_heartbeat_body(json!({"hostname":"test"}));
+        assert_eq!(body["accept_job"], false);
+        assert_eq!(body["wait_seconds"], 0);
+        assert_eq!(body["metadata"]["hostname"], "test");
     }
 
     #[test]
