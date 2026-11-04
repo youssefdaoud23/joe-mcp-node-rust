@@ -88,14 +88,19 @@ async fn perform_update(args: &Args, backup: &Path) -> Result<String> {
     }
     Ok(installed_version(&args.agent).await)
 }
-async fn rollback(args: &Args, backup: &Path) -> bool {
-    let restored = restore_snapshot(&backup.join("agent"), &args.agent)
+async fn restore_both_payloads(args: &Args, backup: &Path) -> bool {
+    // Failure to restore one binary must not prevent restoring the other.
+    // Otherwise a partial failed upgrade can leave both binaries damaged.
+    let agent_restored = restore_snapshot(&backup.join("agent"), &args.agent)
         .await
-        .is_ok()
-        && restore_snapshot(&backup.join("updater"), &args.updater)
-            .await
-            .is_ok();
-    if !restored {
+        .is_ok();
+    let updater_restored = restore_snapshot(&backup.join("updater"), &args.updater)
+        .await
+        .is_ok();
+    agent_restored && updater_restored
+}
+async fn rollback(args: &Args, backup: &Path) -> bool {
+    if !restore_both_payloads(args, backup).await {
         return false;
     }
     let _ = systemctl(&["daemon-reload"]).await;
@@ -281,6 +286,39 @@ mod tests {
         assert_eq!(fs::read(&agent).await.unwrap(), b"old-agent");
         assert_eq!(fs::read(&updater).await.unwrap(), b"old-updater");
         let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_attempts_updater_restore_even_if_agent_snapshot_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "joe-rust-partial-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let backup = root.join("backup");
+        fs::create_dir_all(&backup).await.unwrap();
+        let agent = root.join("agent");
+        let updater = root.join("updater");
+        fs::write(&agent, b"new-agent").await.unwrap();
+        fs::write(&updater, b"broken-updater").await.unwrap();
+        fs::write(backup.join("updater"), b"previous-working-updater")
+            .await
+            .unwrap();
+        let args = Args {
+            server: "https://mcp.example.test".into(),
+            agent: agent.clone(),
+            updater: updater.clone(),
+            service: "joe-mcp-rust-agent.service".into(),
+            status: root.join("status.json"),
+        };
+        // The agent backup was never created: a partial snapshot or disk error.
+        // A failed first restoration must NOT short-circuit the second.
+        assert!(!restore_both_payloads(&args, &backup).await);
+        assert_eq!(fs::read(&agent).await.unwrap(), b"new-agent");
+        assert_eq!(
+            fs::read(&updater).await.unwrap(),
+            b"previous-working-updater"
+        );
+        fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]
